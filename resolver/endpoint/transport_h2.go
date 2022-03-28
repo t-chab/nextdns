@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"net"
 	"net/http"
+	"os"
 	"runtime"
 	"time"
 )
@@ -19,7 +20,40 @@ type transport struct {
 func newTransportH2(e *DOHEndpoint, addrs []string) http.RoundTripper {
 	d := &parallelDialer{}
 	d.FallbackDelay = -1 // disable happy eyeball, we do our own
-	var t http.RoundTripper = &http.Transport{
+	var t http.RoundTripper
+	_, proxyEnabled := os.LookupEnv("HTTP_PROXY")
+	if proxyEnabled {
+		t = proxyingRoundTripper(e)
+	} else {
+		t = standardRoundTripper(e, addrs, d)
+	}
+	runtime.SetFinalizer(t, func(t *http.Transport) {
+		t.CloseIdleConnections()
+	})
+	if e.onConnect != nil {
+		t = roundTripperConnectTracer{
+			RoundTripper: t,
+			OnConnect:    e.onConnect,
+		}
+	}
+	return t
+}
+
+func proxyingRoundTripper(e *DOHEndpoint) *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		TLSClientConfig: &tls.Config{
+			ServerName:         e.Hostname,
+			RootCAs:            getRootCAs(),
+			ClientSessionCache: tls.NewLRUClientSessionCache(0),
+		},
+		DialContext:       nil,
+		ForceAttemptHTTP2: true,
+	}
+}
+
+func standardRoundTripper(e *DOHEndpoint, addrs []string, d *parallelDialer) *http.Transport {
+	return &http.Transport{
 		TLSClientConfig: &tls.Config{
 			ServerName:         e.Hostname,
 			RootCAs:            getRootCAs(),
@@ -46,16 +80,6 @@ func newTransportH2(e *DOHEndpoint, addrs []string) http.RoundTripper {
 		},
 		ForceAttemptHTTP2: true,
 	}
-	runtime.SetFinalizer(t, func(t *http.Transport) {
-		t.CloseIdleConnections()
-	})
-	if e.onConnect != nil {
-		t = roundTripperConnectTracer{
-			RoundTripper: t,
-			OnConnect:    e.onConnect,
-		}
-	}
-	return t
 }
 
 func (t transport) RoundTrip(req *http.Request) (*http.Response, error) {
